@@ -112,8 +112,17 @@ func (r *Relay) setupTunnel(conn net.Conn) {
 }
 
 func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Health check.
+	if req.URL.Path == "/health" || req.URL.Path == "/" && req.Header.Get("Upgrade") == "" && req.Header.Get("Sec-WebSocket-Key") == "" {
+		// Check if it's a plain GET to root (status page) vs other paths.
+	}
+
 	// WebSocket control path: /_tunnel/connect
 	if req.URL.Path == "/_tunnel/connect" {
+		if !websocket.IsWebSocketUpgrade(req) {
+			http.Error(w, "WebSocket required", http.StatusBadRequest)
+			return
+		}
 		r.handleWsControl(w, req)
 		return
 	}

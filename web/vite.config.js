@@ -1,8 +1,8 @@
 import { defineConfig } from 'vite'
 
 export default defineConfig({
-  base: '/p2p-tunnel/',
+  base: process.env.BUILD_TARGET === 'ghpages' ? '/p2p-tunnel/' : '/',
   build: {
-    outDir: 'dist',
+    outDir: process.env.BUILD_TARGET === 'ghpages' ? 'dist-ghpages' : 'dist',
   },
 })

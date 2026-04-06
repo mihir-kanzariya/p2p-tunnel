@@ -17,9 +17,8 @@ import (
 	"github.com/mihirkanzariya/p2p-tunnel/internal/gateway"
 	"github.com/mihirkanzariya/p2p-tunnel/internal/node"
 	"github.com/mihirkanzariya/p2p-tunnel/internal/tunnel"
+	"github.com/mihirkanzariya/p2p-tunnel/internal/webui"
 )
-
-const browserPageURL = "https://mihir-kanzariya.github.io/p2p-tunnel"
 
 var words = []string{
 	"alpha", "blue", "calm", "dawn", "echo", "fox", "glow", "haze",
@@ -121,37 +120,30 @@ func runHTTP(args []string) {
 	fmt.Printf("  Subdomain:     %s\n", *subdomain)
 	fmt.Printf("  Forwarding to: localhost:%d\n", port)
 
+	// Start embedded web UI server.
+	webBase, err := webui.Serve()
+	if err != nil {
+		fmt.Printf("  Warning: could not start web UI: %v\n", err)
+	}
+
 	// Wait briefly for NAT-mapped addresses to appear.
 	time.Sleep(3 * time.Second)
 
-	// Show the best browser URL.
+	// Pick the best address for browser connection.
 	bestAddr := n.BestBrowserAddr()
-	if bestAddr != "" {
-		fmt.Printf("\n  Browser URL (share this!):\n")
-		fmt.Printf("  -> %s\n", makeBrowserURL(bestAddr))
+	if bestAddr != "" && webBase != "" {
+		browserURL := fmt.Sprintf("%s/?addr=%s", webBase, url.QueryEscape(encodeAddr(bestAddr)))
+		fmt.Printf("\n  Open in browser:\n")
+		fmt.Printf("  -> %s\n", browserURL)
 	}
 
-	// Show all available addresses grouped by type.
-	if webrtc := n.WebRTCAddrs(); len(webrtc) > 0 {
-		fmt.Printf("\n  WebRTC addresses (direct browser connection):\n")
-		for _, a := range webrtc {
-			fmt.Printf("    %s\n", a)
-		}
-	}
-	if relay := n.RelayAddrs(); len(relay) > 0 {
-		fmt.Printf("\n  Relay addresses:\n")
-		for _, a := range relay {
-			fmt.Printf("    %s\n", a)
-		}
-	}
-
-	fmt.Printf("\n  All addresses:\n")
+	// Show all addresses.
+	fmt.Printf("\n  Addresses:\n")
 	for _, a := range n.FullAddrs() {
 		fmt.Printf("    %s\n", a)
 	}
 
-	// Also always show peer ID for DHT discovery.
-	fmt.Printf("\n  Peer ID (for DHT discovery): %s\n", n.PeerID())
+	fmt.Printf("\n  Peer ID: %s\n", n.PeerID())
 	fmt.Printf("  Press Ctrl+C to close.\n\n")
 
 	sigCh := make(chan os.Signal, 1)
@@ -160,12 +152,10 @@ func runHTTP(args []string) {
 	fmt.Println("\n  Tunnel closed.")
 }
 
-// makeBrowserURL encodes a multiaddr into a browser-accessible URL.
-func makeBrowserURL(multiaddr string) string {
+// encodeAddr base64url-encodes a multiaddr for use in URLs.
+func encodeAddr(multiaddr string) string {
 	encoded := base64.URLEncoding.EncodeToString([]byte(multiaddr))
-	// Trim padding for cleaner URLs.
-	encoded = strings.TrimRight(encoded, "=")
-	return fmt.Sprintf("%s/?addr=%s", browserPageURL, url.QueryEscape(encoded))
+	return strings.TrimRight(encoded, "=")
 }
 
 func runGateway(args []string) {

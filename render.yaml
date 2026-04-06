@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: p2p-relay
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerCommand: p2p-tunnel relay -control :4443 -http :10000 -d p2p-relay.onrender.com
+    envVars:
+      - key: PORT
+        value: "10000"

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
 	"github.com/mihirkanzariya/p2p-tunnel/internal/proto"
 )
@@ -18,34 +19,59 @@ import (
 type tunnel struct {
 	subdomain string
 	session   *yamux.Session
-	conn      net.Conn
 }
 
 type Relay struct {
-	mu      sync.RWMutex
-	tunnels map[string]*tunnel
-	Domain  string
+	mu       sync.RWMutex
+	tunnels  map[string]*tunnel
+	Domain   string
+	upgrader websocket.Upgrader
 }
 
 func New(domain string) *Relay {
-	return &Relay{tunnels: make(map[string]*tunnel), Domain: domain}
+	return &Relay{
+		tunnels: make(map[string]*tunnel),
+		Domain:  domain,
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
+	}
 }
 
+// HandleControl handles raw TCP control connections (for local/self-hosted relays).
 func (r *Relay) HandleControl(conn net.Conn) {
 	defer conn.Close()
+	r.setupTunnel(conn)
+}
 
+// handleWsControl handles WebSocket control connections (for cloud platforms with one port).
+func (r *Relay) handleWsControl(w http.ResponseWriter, req *http.Request) {
+	wsConn, err := r.upgrader.Upgrade(w, req, nil)
+	if err != nil {
+		log.Printf("[relay] ws upgrade error: %v", err)
+		return
+	}
+	// Wrap WebSocket as net.Conn for yamux.
+	conn := NewWSConn(wsConn)
+	r.setupTunnel(conn)
+}
+
+func (r *Relay) setupTunnel(conn net.Conn) {
 	var hs proto.Handshake
 	if err := proto.RecvJSON(conn, &hs); err != nil {
+		conn.Close()
 		return
 	}
 	sub := strings.TrimSpace(strings.ToLower(hs.Subdomain))
 	if sub == "" {
 		proto.SendJSON(conn, proto.HandshakeResponse{OK: false, Error: "subdomain required"})
+		conn.Close()
 		return
 	}
 	for _, c := range sub {
 		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
 			proto.SendJSON(conn, proto.HandshakeResponse{OK: false, Error: "invalid subdomain"})
+			conn.Close()
 			return
 		}
 	}
@@ -56,6 +82,7 @@ func (r *Relay) HandleControl(conn net.Conn) {
 	cfg.LogOutput = io.Discard
 	session, err := yamux.Client(conn, cfg)
 	if err != nil {
+		conn.Close()
 		return
 	}
 
@@ -66,7 +93,7 @@ func (r *Relay) HandleControl(conn net.Conn) {
 		proto.SendJSON(conn, proto.HandshakeResponse{OK: false, Error: fmt.Sprintf("%q already taken", sub)})
 		return
 	}
-	r.tunnels[sub] = &tunnel{subdomain: sub, session: session, conn: conn}
+	r.tunnels[sub] = &tunnel{subdomain: sub, session: session}
 	r.mu.Unlock()
 
 	url := fmt.Sprintf("https://%s.%s", sub, r.Domain)
@@ -82,6 +109,12 @@ func (r *Relay) HandleControl(conn net.Conn) {
 }
 
 func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// WebSocket control path: /_tunnel/connect
+	if req.URL.Path == "/_tunnel/connect" {
+		r.handleWsControl(w, req)
+		return
+	}
+
 	host := req.Host
 	if idx := strings.LastIndex(host, ":"); idx != -1 {
 		host = host[:idx]
@@ -149,10 +182,4 @@ code{background:#f3f4f6;padding:2px 6px;border-radius:4px}.s{background:#f0fdf4;
 <p>Expose your local server:</p>
 <pre><code>p2p-tunnel http 3000</code></pre>
 </body></html>`, n)
-}
-
-func (r *Relay) ActiveCount() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.tunnels)
 }

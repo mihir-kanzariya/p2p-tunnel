@@ -17,7 +17,7 @@ import (
 )
 
 // Default public relay — anyone can run their own.
-const defaultRelay = "p2p-relay.fly.dev:4443"
+const defaultRelay = "p2p-relay.onrender.com"
 
 var words = []string{
 	"alpha", "blue", "calm", "dawn", "echo", "fox", "glow", "haze",

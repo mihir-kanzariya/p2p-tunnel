@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
 	"github.com/mihirkanzariya/p2p-tunnel/internal/proto"
+	"github.com/mihirkanzariya/p2p-tunnel/internal/relay"
 )
 
 type Client struct {
@@ -21,16 +23,55 @@ type Client struct {
 	PublicURL string
 
 	session *yamux.Session
-	conn    net.Conn
+	closer  io.Closer
 }
 
 func (c *Client) Connect() error {
+	// Determine if relay is WebSocket (cloud) or raw TCP (self-hosted).
+	if strings.HasPrefix(c.RelayAddr, "ws://") || strings.HasPrefix(c.RelayAddr, "wss://") || !strings.Contains(c.RelayAddr, ":") || isHTTPS(c.RelayAddr) {
+		return c.connectWS()
+	}
+	return c.connectTCP()
+}
+
+func isHTTPS(addr string) bool {
+	return strings.HasSuffix(addr, ".onrender.com") ||
+		strings.HasSuffix(addr, ".fly.dev") ||
+		strings.HasSuffix(addr, ".railway.app") ||
+		strings.HasSuffix(addr, ".up.railway.app")
+}
+
+func (c *Client) connectWS() error {
+	wsURL := c.RelayAddr
+	if !strings.HasPrefix(wsURL, "ws://") && !strings.HasPrefix(wsURL, "wss://") {
+		wsURL = "wss://" + wsURL
+	}
+	if !strings.Contains(wsURL, "/_tunnel/") {
+		wsURL = wsURL + "/_tunnel/connect"
+	}
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+	wsConn, _, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		return fmt.Errorf("websocket dial: %w", err)
+	}
+	conn := relay.NewWSConn(wsConn)
+	c.closer = conn
+	return c.handshake(conn)
+}
+
+func (c *Client) connectTCP() error {
 	conn, err := net.DialTimeout("tcp", c.RelayAddr, 10*time.Second)
 	if err != nil {
-		return fmt.Errorf("cannot reach relay: %w", err)
+		return fmt.Errorf("tcp dial: %w", err)
 	}
-	c.conn = conn
+	c.closer = conn
+	return c.handshake(conn)
+}
 
+func (c *Client) handshake(conn net.Conn) error {
 	proto.SendJSON(conn, proto.Handshake{Subdomain: c.Subdomain})
 	var resp proto.HandshakeResponse
 	if err := proto.RecvJSON(conn, &resp); err != nil {
@@ -50,7 +91,7 @@ func (c *Client) Connect() error {
 	session, err := yamux.Server(conn, cfg)
 	if err != nil {
 		conn.Close()
-		return fmt.Errorf("session error: %w", err)
+		return fmt.Errorf("session: %w", err)
 	}
 	c.session = session
 	return nil
@@ -60,9 +101,6 @@ func (c *Client) Serve() {
 	for {
 		stream, err := c.session.Accept()
 		if err != nil {
-			if strings.Contains(err.Error(), "session shutdown") {
-				return
-			}
 			return
 		}
 		go c.proxy(stream)
@@ -71,7 +109,6 @@ func (c *Client) Serve() {
 
 func (c *Client) proxy(stream net.Conn) {
 	defer stream.Close()
-
 	req, err := http.ReadRequest(bufio.NewReader(stream))
 	if err != nil {
 		return
@@ -84,7 +121,6 @@ func (c *Client) proxy(stream net.Conn) {
 		return
 	}
 	defer local.Close()
-
 	req.Write(local)
 	resp, err := http.ReadResponse(bufio.NewReader(local), req)
 	if err != nil {
@@ -119,7 +155,7 @@ func (c *Client) Close() {
 	if c.session != nil {
 		c.session.Close()
 	}
-	if c.conn != nil {
-		c.conn.Close()
+	if c.closer != nil {
+		c.closer.Close()
 	}
 }

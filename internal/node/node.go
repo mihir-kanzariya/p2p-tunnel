@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,21 +12,20 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/multiformats/go-multiaddr"
 )
 
 const (
-	// Protocol ID for tunnel HTTP streams.
-	TunnelProtocol = "/p2p-tunnel/http/1.0.0"
-	// DHT namespace for tunnel registrations.
+	TunnelProtocol  = "/p2p-tunnel/http/1.0.0"
 	TunnelNamespace = "p2p-tunnel"
 )
 
-// BootstrapPeers are well-known libp2p peers used for initial discovery.
 var BootstrapPeers []multiaddr.Multiaddr
 
 func init() {
@@ -44,7 +44,6 @@ func init() {
 	}
 }
 
-// Node wraps a libp2p host with DHT and discovery.
 type Node struct {
 	Host      host.Host
 	DHT       *dht.IpfsDHT
@@ -53,46 +52,75 @@ type Node struct {
 	Cancel    context.CancelFunc
 }
 
-// New creates a new libp2p node with DHT, relay, and NAT traversal.
-// TCP-only to avoid QUIC compatibility issues with newer Go versions.
+// New creates a libp2p node with TCP + WebSocket transports, DHT, relay, and AutoRelay.
 func New(ctx context.Context, port int) (*Node, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
-	listenAddr := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
+	tcpAddr := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
+	wsPort := port + 1
+	if port == 0 {
+		wsPort = 0
+	}
+	wsAddr := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d/ws", wsPort)
+
+	// Peer source for AutoRelay — uses connected peers as relay candidates.
+	// This runs after DHT bootstrap, so peers will be available.
+	peerSource := func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
+		ch := make(chan peer.AddrInfo, numPeers)
+		go func() {
+			defer close(ch)
+			// Wait for the host to be set up and have connections.
+			time.Sleep(15 * time.Second)
+			// Offer connected peers as potential relays.
+			for _, p := range BootstrapPeers {
+				pi, err := peer.AddrInfoFromP2pAddr(p)
+				if err != nil {
+					continue
+				}
+				select {
+				case ch <- *pi:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		return ch
+	}
 
 	h, err := libp2p.New(
 		libp2p.Transport(tcp.NewTCPTransport),
-		libp2p.ListenAddrStrings(listenAddr),
+		libp2p.Transport(ws.New),
+		libp2p.ListenAddrStrings(tcpAddr, wsAddr),
 		libp2p.Security(libp2ptls.ID, libp2ptls.New),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.NATPortMap(),
 		libp2p.EnableRelay(),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableNATService(),
+		libp2p.EnableAutoRelayWithPeerSource(peerSource, autorelay.WithNumRelays(2)),
 	)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("create host: %w", err)
 	}
 
-	// Every node acts as a relay for others — true P2P, everyone helps.
+	// Act as a relay for others — every node helps the network.
 	relayv2.New(h)
 
-	// DHT in auto-server mode — participates fully when reachable.
+	// DHT for peer/tunnel discovery.
 	kdht, err := dht.New(ctx, h, dht.Mode(dht.ModeAutoServer))
 	if err != nil {
 		cancel()
 		h.Close()
 		return nil, fmt.Errorf("create dht: %w", err)
 	}
-
 	if err := kdht.Bootstrap(ctx); err != nil {
 		cancel()
 		h.Close()
 		return nil, fmt.Errorf("bootstrap dht: %w", err)
 	}
 
-	// Connect to bootstrap peers in parallel.
+	// Connect to bootstrap peers.
 	var wg sync.WaitGroup
 	for _, pAddr := range BootstrapPeers {
 		pi, err := peer.AddrInfoFromP2pAddr(pAddr)
@@ -120,8 +148,6 @@ func New(ctx context.Context, port int) (*Node, error) {
 	}, nil
 }
 
-// ConnectToPeer connects directly to a peer by multiaddr string.
-// Useful for local/direct peering without relying on DHT propagation.
 func (n *Node) ConnectToPeer(addr string) error {
 	ma, err := multiaddr.NewMultiaddr(addr)
 	if err != nil {
@@ -134,7 +160,6 @@ func (n *Node) ConnectToPeer(addr string) error {
 	return n.Host.Connect(n.Ctx, *pi)
 }
 
-// FullAddrs returns full multiaddrs including peer ID (for sharing with others).
 func (n *Node) FullAddrs() []string {
 	var addrs []string
 	for _, a := range n.Host.Addrs() {
@@ -144,24 +169,63 @@ func (n *Node) FullAddrs() []string {
 	return addrs
 }
 
-// Advertise announces that this node provides a tunnel for the given subdomain.
+// RelayAddrs returns circuit relay addresses (if any) that browsers can connect through.
+func (n *Node) RelayAddrs() []string {
+	var relayAddrs []string
+	for _, a := range n.Host.Addrs() {
+		s := a.String()
+		if strings.Contains(s, "p2p-circuit") {
+			full := fmt.Sprintf("%s/p2p/%s", a, n.Host.ID())
+			relayAddrs = append(relayAddrs, full)
+		}
+	}
+	return relayAddrs
+}
+
+// WsAddrs returns all WebSocket addresses.
+func (n *Node) WsAddrs() []string {
+	var wsAddrs []string
+	for _, a := range n.Host.Addrs() {
+		s := a.String()
+		if strings.Contains(s, "/ws") {
+			full := fmt.Sprintf("%s/p2p/%s", a, n.Host.ID())
+			wsAddrs = append(wsAddrs, full)
+		}
+	}
+	return wsAddrs
+}
+
+// PublicWsAddrs returns WebSocket addresses that are publicly routable (not 127.0.0.1 or 10.x).
+func (n *Node) PublicWsAddrs() []string {
+	var addrs []string
+	for _, a := range n.Host.Addrs() {
+		s := a.String()
+		if !strings.Contains(s, "/ws") {
+			continue
+		}
+		if strings.HasPrefix(s, "/ip4/127.") || strings.HasPrefix(s, "/ip4/10.") ||
+			strings.HasPrefix(s, "/ip4/192.168.") || strings.HasPrefix(s, "/ip4/172.") {
+			continue
+		}
+		full := fmt.Sprintf("%s/p2p/%s", a, n.Host.ID())
+		addrs = append(addrs, full)
+	}
+	return addrs
+}
+
 func (n *Node) Advertise(subdomain string) {
 	key := TunnelNamespace + "/" + subdomain
 	n.Discovery.Advertise(n.Ctx, key)
 }
 
-// FindTunnelPeer discovers the peer providing a tunnel for the given subdomain.
 func (n *Node) FindTunnelPeer(subdomain string) (peer.AddrInfo, error) {
 	key := TunnelNamespace + "/" + subdomain
-
 	ctx, cancel := context.WithTimeout(n.Ctx, 15*time.Second)
 	defer cancel()
-
 	peerCh, err := n.Discovery.FindPeers(ctx, key)
 	if err != nil {
 		return peer.AddrInfo{}, fmt.Errorf("find peers: %w", err)
 	}
-
 	for p := range peerCh {
 		if p.ID == n.Host.ID() {
 			continue
@@ -173,19 +237,16 @@ func (n *Node) FindTunnelPeer(subdomain string) (peer.AddrInfo, error) {
 	return peer.AddrInfo{}, fmt.Errorf("no peer found for subdomain %q", subdomain)
 }
 
-// Close shuts down the node.
 func (n *Node) Close() {
 	n.Cancel()
 	n.DHT.Close()
 	n.Host.Close()
 }
 
-// PeerID returns the peer ID string.
 func (n *Node) PeerID() string {
 	return n.Host.ID().String()
 }
 
-// Addrs returns the listen addresses.
 func (n *Node) Addrs() []multiaddr.Multiaddr {
 	return n.Host.Addrs()
 }

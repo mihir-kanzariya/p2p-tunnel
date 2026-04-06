@@ -3,3 +3,5 @@ bin/
 *.test
 *.out
 dist/
+web/node_modules/
+web/dist/

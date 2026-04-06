@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"math/rand"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,6 +18,8 @@ import (
 	"github.com/mihirkanzariya/p2p-tunnel/internal/node"
 	"github.com/mihirkanzariya/p2p-tunnel/internal/tunnel"
 )
+
+const browserPageURL = "https://mihir-kanzariya.github.io/p2p-tunnel"
 
 var words = []string{
 	"alpha", "blue", "calm", "dawn", "echo", "fox", "glow", "haze",
@@ -37,10 +42,10 @@ Usage:
   p2p-tunnel version                         show version
 
 How it works:
-  1. "p2p-tunnel http 3000" joins the P2P network and advertises your tunnel
-  2. "p2p-tunnel gateway" on any public-IP machine accepts HTTP and routes via DHT
-  3. Multiple gateways = no single point of failure
-  4. NAT traversal + hole punching built in`)
+  1. "p2p-tunnel http 3000" joins the P2P network
+  2. Get a browser-accessible URL via relay nodes — no server needed
+  3. NAT traversal + hole punching built in
+  4. Every node is a relay — no single point of failure`)
 }
 
 func main() {
@@ -98,14 +103,8 @@ func runHTTP(args []string) {
 	}
 	defer n.Close()
 
-	fmt.Printf("  Peer ID:       %s\n", n.PeerID()[:16]+"...")
-	fmt.Printf("  Listening on:  ")
-	for _, a := range n.Addrs() {
-		fmt.Printf("%s ", a)
-	}
-	fmt.Println()
+	fmt.Printf("  Peer ID:  %s\n", n.PeerID()[:16]+"...")
 
-	// Wait a moment for DHT to populate.
 	fmt.Printf("  Connecting to peers...")
 	time.Sleep(5 * time.Second)
 	peerCount := len(n.Host.Network().Peers())
@@ -121,12 +120,47 @@ func runHTTP(args []string) {
 	fmt.Printf("\n  Tunnel active!\n")
 	fmt.Printf("  Subdomain:     %s\n", *subdomain)
 	fmt.Printf("  Forwarding to: localhost:%d\n", port)
-	fmt.Printf("  Peer ID:       %s\n", n.PeerID())
-	fmt.Printf("\n  Connect address (share with gateway):\n")
+
+	// Check for relay addresses briefly (5s), then show what we have.
+	fmt.Printf("  Checking for relay addresses...")
+	time.Sleep(5 * time.Second)
+	relayAddrs := n.RelayAddrs()
+	fmt.Println()
+
+	// Collect all browser-usable addresses: relay first, then public WS, then local WS.
+	var browserURLs []string
+	for _, a := range relayAddrs {
+		browserURLs = append(browserURLs, makeBrowserURL(a))
+	}
+	publicWs := n.PublicWsAddrs()
+	for _, a := range publicWs {
+		browserURLs = append(browserURLs, makeBrowserURL(a))
+	}
+
+	if len(browserURLs) > 0 {
+		fmt.Printf("\n  Browser URL (share this!):\n")
+		fmt.Printf("  -> %s\n", browserURLs[0])
+		if len(browserURLs) > 1 {
+			fmt.Printf("\n  Alternate URLs:\n")
+			for _, u := range browserURLs[1:] {
+				fmt.Printf("  -> %s\n", u)
+			}
+		}
+	} else {
+		// Local-only WS addresses.
+		fmt.Printf("\n  Local browser URL:\n")
+		for _, a := range n.WsAddrs() {
+			fmt.Printf("  -> %s\n", makeBrowserURL(a))
+		}
+	}
+
+	fmt.Printf("\n  Direct connect (for gateways / other peers):\n")
 	for _, a := range n.FullAddrs() {
 		fmt.Printf("    %s\n", a)
 	}
-	fmt.Printf("\n  Any gateway node can now route traffic to this tunnel.\n")
+
+	// Also always show peer ID for DHT discovery.
+	fmt.Printf("\n  Peer ID (for DHT discovery): %s\n", n.PeerID())
 	fmt.Printf("  Press Ctrl+C to close.\n\n")
 
 	sigCh := make(chan os.Signal, 1)
@@ -135,12 +169,20 @@ func runHTTP(args []string) {
 	fmt.Println("\n  Tunnel closed.")
 }
 
+// makeBrowserURL encodes a multiaddr into a browser-accessible URL.
+func makeBrowserURL(multiaddr string) string {
+	encoded := base64.URLEncoding.EncodeToString([]byte(multiaddr))
+	// Trim padding for cleaner URLs.
+	encoded = strings.TrimRight(encoded, "=")
+	return fmt.Sprintf("%s/?addr=%s", browserPageURL, url.QueryEscape(encoded))
+}
+
 func runGateway(args []string) {
 	fs := flag.NewFlagSet("gateway", flag.ExitOnError)
 	httpAddr := fs.String("http", ":8080", "HTTP listen address")
 	domain := fs.String("domain", "localhost:8080", "Base domain for URLs")
 	p2pPort := fs.Int("p2p-port", 4001, "P2P listen port")
-	peerAddr := fs.String("peer", "", "Direct peer address to connect to (optional, skips DHT wait)")
+	peerAddr := fs.String("peer", "", "Direct peer address to connect to")
 	fs.Parse(args)
 
 	fmt.Printf("\n  p2p-tunnel gateway\n\n")
@@ -154,7 +196,7 @@ func runGateway(args []string) {
 	}
 	defer n.Close()
 
-	fmt.Printf("  Peer ID:       %s\n", n.PeerID()[:16]+"...")
+	fmt.Printf("  Peer ID:  %s\n", n.PeerID()[:16]+"...")
 
 	if *peerAddr != "" {
 		fmt.Printf("  Connecting to peer directly...\n")

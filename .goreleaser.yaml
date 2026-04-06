@@ -1,0 +1,44 @@
+version: 2
+
+builds:
+  - main: ./cmd/client
+    binary: p2p-tunnel
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - format: tar.gz
+    name_template: "p2p-tunnel_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "checksums.txt"
+
+brews:
+  - repository:
+      owner: mihir-kanzariya
+      name: homebrew-tap
+    name: p2p-tunnel
+    homepage: "https://github.com/mihir-kanzariya/p2p-tunnel"
+    description: "Expose localhost to the internet. P2P alternative to ngrok."
+    license: "MIT"
+    install: |
+      bin.install "p2p-tunnel"
+    test: |
+      system "#{bin}/p2p-tunnel", "--help"
+
+release:
+  github:
+    owner: mihir-kanzariya
+    name: p2p-tunnel

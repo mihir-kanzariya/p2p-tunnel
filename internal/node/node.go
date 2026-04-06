@@ -13,10 +13,11 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
-	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	libp2pwebrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
 	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/multiformats/go-multiaddr"
 )
@@ -52,26 +53,23 @@ type Node struct {
 	Cancel    context.CancelFunc
 }
 
-// New creates a libp2p node with TCP + WebSocket transports, DHT, relay, and AutoRelay.
+// New creates a libp2p node with ALL default transports (TCP, WebSocket, QUIC, WebRTC),
+// plus DHT, relay, AutoRelay, NAT traversal, and hole punching.
 func New(ctx context.Context, port int) (*Node, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
-	tcpAddr := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
-	wsPort := port + 1
-	if port == 0 {
-		wsPort = 0
+	// Listen on TCP + WebRTC. QUIC/WebTransport disabled due to quic-go bug with Go 1.26.
+	listenAddrs := []string{
+		fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port),
+		fmt.Sprintf("/ip4/0.0.0.0/udp/%d/webrtc-direct", port),
 	}
-	wsAddr := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d/ws", wsPort)
 
-	// Peer source for AutoRelay — uses connected peers as relay candidates.
-	// This runs after DHT bootstrap, so peers will be available.
+	// Peer source for AutoRelay.
 	peerSource := func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
 		ch := make(chan peer.AddrInfo, numPeers)
 		go func() {
 			defer close(ch)
-			// Wait for the host to be set up and have connections.
 			time.Sleep(15 * time.Second)
-			// Offer connected peers as potential relays.
 			for _, p := range BootstrapPeers {
 				pi, err := peer.AddrInfoFromP2pAddr(p)
 				if err != nil {
@@ -87,12 +85,14 @@ func New(ctx context.Context, port int) (*Node, error) {
 		return ch
 	}
 
+	// Explicitly set transports: TCP + WebSocket + WebRTC. No QUIC (buggy with Go 1.26).
 	h, err := libp2p.New(
 		libp2p.Transport(tcp.NewTCPTransport),
 		libp2p.Transport(ws.New),
-		libp2p.ListenAddrStrings(tcpAddr, wsAddr),
+		libp2p.Transport(libp2pwebrtc.New),
 		libp2p.Security(libp2ptls.ID, libp2ptls.New),
 		libp2p.Security(noise.ID, noise.New),
+		libp2p.ListenAddrStrings(listenAddrs...),
 		libp2p.NATPortMap(),
 		libp2p.EnableRelay(),
 		libp2p.EnableHolePunching(),
@@ -104,7 +104,7 @@ func New(ctx context.Context, port int) (*Node, error) {
 		return nil, fmt.Errorf("create host: %w", err)
 	}
 
-	// Act as a relay for others — every node helps the network.
+	// Every node acts as a relay — true P2P.
 	relayv2.New(h)
 
 	// DHT for peer/tunnel discovery.
@@ -169,48 +169,90 @@ func (n *Node) FullAddrs() []string {
 	return addrs
 }
 
-// RelayAddrs returns circuit relay addresses (if any) that browsers can connect through.
+// WebRTCAddrs returns WebRTC-direct addresses (browser-accessible without port forwarding).
+func (n *Node) WebRTCAddrs() []string {
+	var addrs []string
+	for _, a := range n.Host.Addrs() {
+		s := a.String()
+		if strings.Contains(s, "webrtc") {
+			full := fmt.Sprintf("%s/p2p/%s", a, n.Host.ID())
+			addrs = append(addrs, full)
+		}
+	}
+	return addrs
+}
+
+// PublicWebRTCAddrs returns public (non-local) WebRTC addresses.
+func (n *Node) PublicWebRTCAddrs() []string {
+	var addrs []string
+	for _, a := range n.WebRTCAddrs() {
+		if strings.Contains(a, "/127.") || strings.Contains(a, "/10.") ||
+			strings.Contains(a, "/192.168.") || strings.Contains(a, "/172.") {
+			continue
+		}
+		addrs = append(addrs, a)
+	}
+	return addrs
+}
+
+// RelayAddrs returns circuit relay addresses.
 func (n *Node) RelayAddrs() []string {
-	var relayAddrs []string
+	var addrs []string
 	for _, a := range n.Host.Addrs() {
 		s := a.String()
 		if strings.Contains(s, "p2p-circuit") {
 			full := fmt.Sprintf("%s/p2p/%s", a, n.Host.ID())
-			relayAddrs = append(relayAddrs, full)
+			addrs = append(addrs, full)
 		}
 	}
-	return relayAddrs
+	return addrs
 }
 
-// WsAddrs returns all WebSocket addresses.
+// WsAddrs returns WebSocket addresses.
 func (n *Node) WsAddrs() []string {
-	var wsAddrs []string
+	var addrs []string
 	for _, a := range n.Host.Addrs() {
 		s := a.String()
 		if strings.Contains(s, "/ws") {
 			full := fmt.Sprintf("%s/p2p/%s", a, n.Host.ID())
-			wsAddrs = append(wsAddrs, full)
+			addrs = append(addrs, full)
 		}
-	}
-	return wsAddrs
-}
-
-// PublicWsAddrs returns WebSocket addresses that are publicly routable (not 127.0.0.1 or 10.x).
-func (n *Node) PublicWsAddrs() []string {
-	var addrs []string
-	for _, a := range n.Host.Addrs() {
-		s := a.String()
-		if !strings.Contains(s, "/ws") {
-			continue
-		}
-		if strings.HasPrefix(s, "/ip4/127.") || strings.HasPrefix(s, "/ip4/10.") ||
-			strings.HasPrefix(s, "/ip4/192.168.") || strings.HasPrefix(s, "/ip4/172.") {
-			continue
-		}
-		full := fmt.Sprintf("%s/p2p/%s", a, n.Host.ID())
-		addrs = append(addrs, full)
 	}
 	return addrs
+}
+
+// PublicWsAddrs returns public WebSocket addresses.
+func (n *Node) PublicWsAddrs() []string {
+	var addrs []string
+	for _, a := range n.WsAddrs() {
+		if strings.Contains(a, "/127.") || strings.Contains(a, "/10.") ||
+			strings.Contains(a, "/192.168.") || strings.Contains(a, "/172.") {
+			continue
+		}
+		addrs = append(addrs, a)
+	}
+	return addrs
+}
+
+// BestBrowserAddr returns the best address for browser connectivity.
+// Priority: public WebRTC > relay > public WS > local WS
+func (n *Node) BestBrowserAddr() string {
+	if addrs := n.PublicWebRTCAddrs(); len(addrs) > 0 {
+		return addrs[0]
+	}
+	if addrs := n.RelayAddrs(); len(addrs) > 0 {
+		return addrs[0]
+	}
+	if addrs := n.PublicWsAddrs(); len(addrs) > 0 {
+		return addrs[0]
+	}
+	if addrs := n.WebRTCAddrs(); len(addrs) > 0 {
+		return addrs[0]
+	}
+	if addrs := n.WsAddrs(); len(addrs) > 0 {
+		return addrs[0]
+	}
+	return ""
 }
 
 func (n *Node) Advertise(subdomain string) {

@@ -2,10 +2,12 @@ import { createLibp2p } from 'libp2p'
 import { noise } from '@chainsafe/libp2p-noise'
 import { yamux } from '@chainsafe/libp2p-yamux'
 import { webSockets } from '@libp2p/websockets'
+import { webRTC } from '@libp2p/webrtc'
 import { bootstrap } from '@libp2p/bootstrap'
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2'
 import { identify } from '@libp2p/identify'
 import { multiaddr } from '@multiformats/multiaddr'
+import { byteStream } from 'it-byte-stream'
 
 const TUNNEL_PROTOCOL = '/p2p-tunnel/http/1.0.0'
 
@@ -34,7 +36,6 @@ function getPeerAddr() {
   const encoded = params.get('addr')
   if (!encoded) return null
   try {
-    // Add back padding.
     let padded = encoded
     while (padded.length % 4 !== 0) padded += '='
     return atob(padded.replace(/-/g, '+').replace(/_/g, '/'))
@@ -43,13 +44,14 @@ function getPeerAddr() {
   }
 }
 
-// Create a libp2p node in the browser.
+// Create a libp2p node with WebRTC + WebSocket + circuit relay.
 async function createNode() {
-  log('Creating browser P2P node...', 'info')
+  log('Creating browser P2P node (WebRTC + WebSocket)...', 'info')
 
   const node = await createLibp2p({
     transports: [
       webSockets(),
+      webRTC(),
       circuitRelayTransport(),
     ],
     connectionEncrypters: [noise()],
@@ -60,7 +62,6 @@ async function createNode() {
     peerDiscovery: [
       bootstrap({
         list: [
-          // Public WebSocket bootstrap peers
           '/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN',
           '/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa',
           '/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb',
@@ -78,54 +79,62 @@ async function createNode() {
 // Connect to the tunnel peer and fetch content.
 async function connectAndFetch(node, peerMultiaddr) {
   setStatus('Connecting to tunnel peer...', 'connecting')
-  log(`Dialing: ${peerMultiaddr.slice(0, 60)}...`, 'info')
+  log(`Dialing: ${peerMultiaddr}`, 'info')
 
   try {
     const ma = multiaddr(peerMultiaddr)
-    const stream = await node.dialProtocol(ma, TUNNEL_PROTOCOL)
-    log('Stream opened!', 'success')
+
+    // Try to dial the peer with the tunnel protocol.
+    const stream = await node.dialProtocol(ma, TUNNEL_PROTOCOL, {
+      runOnLimitedConnection: true,
+    })
+    log('Stream opened to tunnel peer!', 'success')
     setStatus('Connected — loading content...', 'connecting')
 
-    // Send an HTTP GET request through the P2P stream.
-    const httpReq = 'GET / HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\nConnection: close\r\n\r\n'
+    // Send HTTP request through the stream.
+    const httpReq = 'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
     const encoder = new TextEncoder()
     const decoder = new TextDecoder()
 
+    // Use byteStream for easier read/write.
+    const bs = byteStream(stream)
+
     // Write request.
-    const writer = stream.sink
-    const reader = stream.source
+    await bs.write(encoder.encode(httpReq))
 
-    // Collect response.
-    const reqBytes = encoder.encode(httpReq)
+    // Close write side.
+    await stream.closeWrite()
 
-    // Use the stream's sink/source.
-    // Write the request.
-    await stream.sink(async function* () {
-      yield reqBytes
-    }())
-
-    // Close our write side to signal we're done sending.
-    // Read the response.
+    // Read response.
     let responseText = ''
-    for await (const chunk of reader) {
-      responseText += decoder.decode(chunk.subarray())
+    try {
+      while (true) {
+        const chunk = await bs.read()
+        if (!chunk || chunk.length === 0) break
+        responseText += decoder.decode(chunk.subarray(), { stream: true })
+      }
+    } catch (e) {
+      // Stream ended — that's expected.
+    }
+
+    if (responseText.length === 0) {
+      // Fallback: try raw source iteration.
+      for await (const chunk of stream.source) {
+        responseText += decoder.decode(chunk.subarray(), { stream: true })
+      }
     }
 
     log(`Received ${responseText.length} bytes`, 'success')
     setStatus('Connected', 'connected')
 
-    // Parse out the HTTP body.
+    // Parse out HTTP body.
     const bodyStart = responseText.indexOf('\r\n\r\n')
-    if (bodyStart !== -1) {
-      const body = responseText.slice(bodyStart + 4)
-      displayContent(body)
-    } else {
-      displayContent(responseText)
-    }
+    const body = bodyStart !== -1 ? responseText.slice(bodyStart + 4) : responseText
+    displayContent(body)
+
   } catch (err) {
     log(`Connection failed: ${err.message}`, 'error')
     setStatus(`Failed: ${err.message}`, 'error')
-    // Show manual connect.
     document.getElementById('manual-connect').style.display = 'block'
   }
 }
@@ -145,7 +154,7 @@ window.connectManual = async function () {
   await connectAndFetch(window._node, addr)
 }
 
-// Main.
+// Main entry point.
 async function main() {
   const peerAddr = getPeerAddr()
 
@@ -157,13 +166,21 @@ async function main() {
     return
   }
 
-  log(`Target peer: ${peerAddr.slice(0, 80)}...`, 'info')
+  log(`Target: ${peerAddr}`, 'info')
+
+  // Detect transport type from multiaddr.
+  if (peerAddr.includes('webrtc')) {
+    log('Transport: WebRTC (direct peer connection)', 'info')
+  } else if (peerAddr.includes('p2p-circuit')) {
+    log('Transport: Circuit relay', 'info')
+  } else if (peerAddr.includes('/ws')) {
+    log('Transport: WebSocket', 'info')
+  }
 
   try {
     const node = await createNode()
     window._node = node
 
-    // Wait for some peer connections.
     log('Discovering peers...', 'info')
     await new Promise(resolve => setTimeout(resolve, 3000))
     log(`Connected to ${node.getConnections().length} peers`, 'info')

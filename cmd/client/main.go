@@ -121,40 +121,31 @@ func runHTTP(args []string) {
 	fmt.Printf("  Subdomain:     %s\n", *subdomain)
 	fmt.Printf("  Forwarding to: localhost:%d\n", port)
 
-	// Check for relay addresses briefly (5s), then show what we have.
-	fmt.Printf("  Checking for relay addresses...")
-	time.Sleep(5 * time.Second)
-	relayAddrs := n.RelayAddrs()
-	fmt.Println()
+	// Wait briefly for NAT-mapped addresses to appear.
+	time.Sleep(3 * time.Second)
 
-	// Collect all browser-usable addresses: relay first, then public WS, then local WS.
-	var browserURLs []string
-	for _, a := range relayAddrs {
-		browserURLs = append(browserURLs, makeBrowserURL(a))
-	}
-	publicWs := n.PublicWsAddrs()
-	for _, a := range publicWs {
-		browserURLs = append(browserURLs, makeBrowserURL(a))
-	}
-
-	if len(browserURLs) > 0 {
+	// Show the best browser URL.
+	bestAddr := n.BestBrowserAddr()
+	if bestAddr != "" {
 		fmt.Printf("\n  Browser URL (share this!):\n")
-		fmt.Printf("  -> %s\n", browserURLs[0])
-		if len(browserURLs) > 1 {
-			fmt.Printf("\n  Alternate URLs:\n")
-			for _, u := range browserURLs[1:] {
-				fmt.Printf("  -> %s\n", u)
-			}
+		fmt.Printf("  -> %s\n", makeBrowserURL(bestAddr))
+	}
+
+	// Show all available addresses grouped by type.
+	if webrtc := n.WebRTCAddrs(); len(webrtc) > 0 {
+		fmt.Printf("\n  WebRTC addresses (direct browser connection):\n")
+		for _, a := range webrtc {
+			fmt.Printf("    %s\n", a)
 		}
-	} else {
-		// Local-only WS addresses.
-		fmt.Printf("\n  Local browser URL:\n")
-		for _, a := range n.WsAddrs() {
-			fmt.Printf("  -> %s\n", makeBrowserURL(a))
+	}
+	if relay := n.RelayAddrs(); len(relay) > 0 {
+		fmt.Printf("\n  Relay addresses:\n")
+		for _, a := range relay {
+			fmt.Printf("    %s\n", a)
 		}
 	}
 
-	fmt.Printf("\n  Direct connect (for gateways / other peers):\n")
+	fmt.Printf("\n  All addresses:\n")
 	for _, a := range n.FullAddrs() {
 		fmt.Printf("    %s\n", a)
 	}

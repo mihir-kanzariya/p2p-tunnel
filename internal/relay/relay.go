@@ -96,7 +96,7 @@ func (r *Relay) setupTunnel(conn net.Conn) {
 	r.tunnels[sub] = &tunnel{subdomain: sub, session: session}
 	r.mu.Unlock()
 
-	url := fmt.Sprintf("https://%s.%s", sub, r.Domain)
+	url := fmt.Sprintf("https://%s/t/%s", r.Domain, sub)
 	proto.SendJSON(conn, proto.HandshakeResponse{OK: true, URL: url})
 	log.Printf("[relay] + %s (%s)", sub, conn.RemoteAddr())
 
@@ -115,17 +115,38 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	host := req.Host
-	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		host = host[:idx]
-	}
-	parts := strings.SplitN(host, ".", 2)
+	// Path-based routing: /t/<subdomain>/...
 	sub := ""
-	if len(parts) >= 2 {
+	originalPath := req.URL.Path
+	if strings.HasPrefix(req.URL.Path, "/t/") {
+		rest := strings.TrimPrefix(req.URL.Path, "/t/")
+		parts := strings.SplitN(rest, "/", 2)
 		sub = parts[0]
+		if len(parts) > 1 {
+			req.URL.Path = "/" + parts[1]
+		} else {
+			req.URL.Path = "/"
+		}
+		req.RequestURI = req.URL.Path
+		if req.URL.RawQuery != "" {
+			req.RequestURI += "?" + req.URL.RawQuery
+		}
+	}
+
+	// Also check subdomain-based routing (for custom domains).
+	if sub == "" {
+		host := req.Host
+		if idx := strings.LastIndex(host, ":"); idx != -1 {
+			host = host[:idx]
+		}
+		parts := strings.SplitN(host, ".", 2)
+		if len(parts) >= 2 {
+			sub = parts[0]
+		}
 	}
 
 	if sub == "" {
+		req.URL.Path = originalPath
 		r.statusPage(w)
 		return
 	}

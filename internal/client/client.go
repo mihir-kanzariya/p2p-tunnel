@@ -10,10 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
 	"github.com/mihirkanzariya/p2p-tunnel/internal/proto"
-	"github.com/mihirkanzariya/p2p-tunnel/internal/relay"
 )
 
 type Client struct {
@@ -23,57 +21,16 @@ type Client struct {
 	PublicURL string
 
 	session *yamux.Session
-	closer  io.Closer
+	conn    net.Conn
 }
 
 func (c *Client) Connect() error {
-	// Determine if relay is WebSocket (cloud) or raw TCP (self-hosted).
-	if strings.HasPrefix(c.RelayAddr, "ws://") || strings.HasPrefix(c.RelayAddr, "wss://") || !strings.Contains(c.RelayAddr, ":") || isHTTPS(c.RelayAddr) {
-		return c.connectWS()
-	}
-	return c.connectTCP()
-}
-
-func isHTTPS(addr string) bool {
-	return strings.HasSuffix(addr, ".onrender.com") ||
-		strings.HasSuffix(addr, ".fly.dev") ||
-		strings.HasSuffix(addr, ".railway.app") ||
-		strings.HasSuffix(addr, ".up.railway.app")
-}
-
-func (c *Client) connectWS() error {
-	wsURL := c.RelayAddr
-	if !strings.HasPrefix(wsURL, "ws://") && !strings.HasPrefix(wsURL, "wss://") {
-		wsURL = "wss://" + wsURL
-	}
-	if !strings.Contains(wsURL, "/_tunnel/") {
-		wsURL = wsURL + "/_tunnel/connect"
-	}
-
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-		// Force HTTP/1.1 — some CDNs (Cloudflare/Render) need this for WS upgrade.
-		EnableCompression: false,
-	}
-	wsConn, _, err := dialer.Dial(wsURL, nil)
-	if err != nil {
-		return fmt.Errorf("websocket dial: %w", err)
-	}
-	conn := relay.NewWSConn(wsConn)
-	c.closer = conn
-	return c.handshake(conn)
-}
-
-func (c *Client) connectTCP() error {
 	conn, err := net.DialTimeout("tcp", c.RelayAddr, 10*time.Second)
 	if err != nil {
-		return fmt.Errorf("tcp dial: %w", err)
+		return fmt.Errorf("cannot reach relay: %w", err)
 	}
-	c.closer = conn
-	return c.handshake(conn)
-}
+	c.conn = conn
 
-func (c *Client) handshake(conn net.Conn) error {
 	proto.SendJSON(conn, proto.Handshake{Subdomain: c.Subdomain})
 	var resp proto.HandshakeResponse
 	if err := proto.RecvJSON(conn, &resp); err != nil {
@@ -150,8 +107,9 @@ func (c *Client) ConnectWithRetry() error {
 		if attempt == 5 {
 			return fmt.Errorf("failed after %d attempts: %w", attempt, lastErr)
 		}
-		log.Printf("  attempt %d failed: %v, retry in %ds...", attempt, err, attempt*2)
-		time.Sleep(time.Duration(attempt*2) * time.Second)
+		wait := time.Duration(attempt*2) * time.Second
+		log.Printf("  attempt %d failed: %v (retry in %v)", attempt, err, wait)
+		time.Sleep(wait)
 	}
 	return lastErr
 }
@@ -160,7 +118,19 @@ func (c *Client) Close() {
 	if c.session != nil {
 		c.session.Close()
 	}
-	if c.closer != nil {
-		c.closer.Close()
+	if c.conn != nil {
+		c.conn.Close()
 	}
+}
+
+// ParseRelayAddr returns host:port for the relay.
+// If port not specified, tries common ports.
+func ParseRelayAddr(addr string) string {
+	addr = strings.TrimPrefix(addr, "https://")
+	addr = strings.TrimPrefix(addr, "http://")
+	addr = strings.TrimSuffix(addr, "/")
+	if !strings.Contains(addr, ":") {
+		return addr + ":4443"
+	}
+	return addr
 }

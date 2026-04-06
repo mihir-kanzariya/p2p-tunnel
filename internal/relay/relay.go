@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
 	"github.com/mihirkanzariya/p2p-tunnel/internal/proto"
 )
@@ -19,62 +18,37 @@ import (
 type tunnel struct {
 	subdomain string
 	session   *yamux.Session
+	conn      net.Conn
 }
 
 type Relay struct {
-	mu       sync.RWMutex
-	tunnels  map[string]*tunnel
-	Domain   string
-	upgrader websocket.Upgrader
+	mu      sync.RWMutex
+	tunnels map[string]*tunnel
+	Domain  string
 }
 
 func New(domain string) *Relay {
-	return &Relay{
-		tunnels: make(map[string]*tunnel),
-		Domain:  domain,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
-	}
+	return &Relay{tunnels: make(map[string]*tunnel), Domain: domain}
 }
 
-// HandleControl handles raw TCP control connections (for local/self-hosted relays).
 func (r *Relay) HandleControl(conn net.Conn) {
 	defer conn.Close()
-	r.setupTunnel(conn)
-}
 
-// handleWsControl handles WebSocket control connections (for cloud platforms with one port).
-func (r *Relay) handleWsControl(w http.ResponseWriter, req *http.Request) {
-	wsConn, err := r.upgrader.Upgrade(w, req, nil)
-	if err != nil {
-		log.Printf("[relay] ws upgrade error: %v", err)
-		return
-	}
-	// Wrap WebSocket as net.Conn for yamux.
-	conn := NewWSConn(wsConn)
-	r.setupTunnel(conn)
-}
-
-func (r *Relay) setupTunnel(conn net.Conn) {
 	log.Printf("[relay] new connection from %s", conn.RemoteAddr())
+
 	var hs proto.Handshake
 	if err := proto.RecvJSON(conn, &hs); err != nil {
-		log.Printf("[relay] handshake read error: %v", err)
-		conn.Close()
+		log.Printf("[relay] handshake error: %v", err)
 		return
 	}
-	log.Printf("[relay] handshake: subdomain=%q", hs.Subdomain)
 	sub := strings.TrimSpace(strings.ToLower(hs.Subdomain))
 	if sub == "" {
 		proto.SendJSON(conn, proto.HandshakeResponse{OK: false, Error: "subdomain required"})
-		conn.Close()
 		return
 	}
 	for _, c := range sub {
 		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
 			proto.SendJSON(conn, proto.HandshakeResponse{OK: false, Error: "invalid subdomain"})
-			conn.Close()
 			return
 		}
 	}
@@ -85,7 +59,6 @@ func (r *Relay) setupTunnel(conn net.Conn) {
 	cfg.LogOutput = io.Discard
 	session, err := yamux.Client(conn, cfg)
 	if err != nil {
-		conn.Close()
 		return
 	}
 
@@ -96,7 +69,7 @@ func (r *Relay) setupTunnel(conn net.Conn) {
 		proto.SendJSON(conn, proto.HandshakeResponse{OK: false, Error: fmt.Sprintf("%q already taken", sub)})
 		return
 	}
-	r.tunnels[sub] = &tunnel{subdomain: sub, session: session}
+	r.tunnels[sub] = &tunnel{subdomain: sub, session: session, conn: conn}
 	r.mu.Unlock()
 
 	url := fmt.Sprintf("https://%s/t/%s", r.Domain, sub)
@@ -112,24 +85,8 @@ func (r *Relay) setupTunnel(conn net.Conn) {
 }
 
 func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	// Health check.
-	if req.URL.Path == "/health" || req.URL.Path == "/" && req.Header.Get("Upgrade") == "" && req.Header.Get("Sec-WebSocket-Key") == "" {
-		// Check if it's a plain GET to root (status page) vs other paths.
-	}
-
-	// WebSocket control path: /_tunnel/connect
-	if req.URL.Path == "/_tunnel/connect" {
-		if !websocket.IsWebSocketUpgrade(req) {
-			http.Error(w, "WebSocket required", http.StatusBadRequest)
-			return
-		}
-		r.handleWsControl(w, req)
-		return
-	}
-
 	// Path-based routing: /t/<subdomain>/...
 	sub := ""
-	originalPath := req.URL.Path
 	if strings.HasPrefix(req.URL.Path, "/t/") {
 		rest := strings.TrimPrefix(req.URL.Path, "/t/")
 		parts := strings.SplitN(rest, "/", 2)
@@ -158,7 +115,6 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if sub == "" {
-		req.URL.Path = originalPath
 		r.statusPage(w)
 		return
 	}

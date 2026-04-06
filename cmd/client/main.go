@@ -1,24 +1,23 @@
 package main
 
 import (
-	"context"
-	"encoding/base64"
 	"flag"
 	"fmt"
 	"math/rand"
-	"net/url"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
-	"github.com/mihirkanzariya/p2p-tunnel/internal/gateway"
-	"github.com/mihirkanzariya/p2p-tunnel/internal/node"
-	"github.com/mihirkanzariya/p2p-tunnel/internal/tunnel"
-	"github.com/mihirkanzariya/p2p-tunnel/internal/webui"
+	"github.com/mihirkanzariya/p2p-tunnel/internal/client"
+	"github.com/mihirkanzariya/p2p-tunnel/internal/relay"
 )
+
+// Default public relay — anyone can run their own.
+const defaultRelay = "p2p-relay.fly.dev:4443"
 
 var words = []string{
 	"alpha", "blue", "calm", "dawn", "echo", "fox", "glow", "haze",
@@ -32,19 +31,19 @@ func randomSubdomain() string {
 }
 
 func usage() {
-	fmt.Println(`P2P Tunnel — expose localhost to the internet, no central server
+	fmt.Println(`p2p-tunnel — expose localhost to the internet
 
 Usage:
-  p2p-tunnel http <port>                     expose local port via P2P network
-  p2p-tunnel http <port> --subdomain myapp   with custom subdomain
-  p2p-tunnel gateway                         run HTTP gateway (any public IP node)
-  p2p-tunnel version                         show version
+  p2p-tunnel http <port>                  expose local port
+  p2p-tunnel http <port> -s myapp         custom subdomain
+  p2p-tunnel http <port> -r host:4443     use custom relay
+  p2p-tunnel relay                        run your own relay
+  p2p-tunnel version
 
-How it works:
-  1. "p2p-tunnel http 3000" joins the P2P network
-  2. Get a browser-accessible URL via relay nodes — no server needed
-  3. NAT traversal + hole punching built in
-  4. Every node is a relay — no single point of failure`)
+Examples:
+  p2p-tunnel http 3000
+  p2p-tunnel http 8080 -s demo
+  p2p-tunnel relay -d tunnel.example.com`)
 }
 
 func main() {
@@ -52,12 +51,11 @@ func main() {
 		usage()
 		os.Exit(1)
 	}
-
 	switch os.Args[1] {
 	case "http":
 		runHTTP(os.Args[2:])
-	case "gateway":
-		runGateway(os.Args[2:])
+	case "relay":
+		runRelay(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("p2p-tunnel %s\n", version)
 	case "help", "--help", "-h":
@@ -74,143 +72,93 @@ func main() {
 
 func runHTTP(args []string) {
 	fs := flag.NewFlagSet("http", flag.ExitOnError)
-	subdomain := fs.String("subdomain", "", "Custom subdomain (random if empty)")
-	p2pPort := fs.Int("p2p-port", 0, "P2P listen port (random if 0)")
+	subdomain := fs.String("s", "", "Subdomain (random if empty)")
+	relayAddr := fs.String("r", defaultRelay, "Relay server address")
 	fs.Parse(args[1:])
 
 	if len(args) < 1 {
-		fmt.Println("Error: port is required. Usage: p2p-tunnel http <port>")
+		fmt.Println("Usage: p2p-tunnel http <port>")
 		os.Exit(1)
 	}
 	port, err := strconv.Atoi(args[0])
 	if err != nil || port < 1 || port > 65535 {
-		fmt.Println("Error: invalid port number")
+		fmt.Println("Error: invalid port")
 		os.Exit(1)
 	}
 	if *subdomain == "" {
 		*subdomain = randomSubdomain()
 	}
 
-	fmt.Printf("\n  p2p-tunnel\n\n")
-	fmt.Printf("  Joining P2P network...\n")
-
-	ctx := context.Background()
-	n, err := node.New(ctx, *p2pPort)
-	if err != nil {
-		fmt.Printf("  Error: %v\n", err)
-		os.Exit(1)
-	}
-	defer n.Close()
-
-	fmt.Printf("  Peer ID:  %s\n", n.PeerID()[:16]+"...")
-
-	fmt.Printf("  Connecting to peers...")
-	time.Sleep(5 * time.Second)
-	peerCount := len(n.Host.Network().Peers())
-	fmt.Printf(" %d peers found\n", peerCount)
-
-	tc := &tunnel.Client{
-		Node:      n,
-		LocalAddr: fmt.Sprintf("localhost:%d", port),
+	c := &client.Client{
+		RelayAddr: *relayAddr,
 		Subdomain: *subdomain,
-	}
-	tc.Start()
-
-	fmt.Printf("\n  Tunnel active!\n")
-	fmt.Printf("  Subdomain:     %s\n", *subdomain)
-	fmt.Printf("  Forwarding to: localhost:%d\n", port)
-
-	// Start embedded web UI server.
-	webBase, err := webui.Serve()
-	if err != nil {
-		fmt.Printf("  Warning: could not start web UI: %v\n", err)
+		LocalAddr: fmt.Sprintf("localhost:%d", port),
 	}
 
-	// Wait briefly for NAT-mapped addresses to appear.
-	time.Sleep(3 * time.Second)
+	fmt.Printf("\n  p2p-tunnel\n\n")
+	fmt.Printf("  Connecting to relay %s ...\n", *relayAddr)
 
-	// Pick the best address for browser connection.
-	bestAddr := n.BestBrowserAddr()
-	if bestAddr != "" && webBase != "" {
-		browserURL := fmt.Sprintf("%s/?addr=%s", webBase, url.QueryEscape(encodeAddr(bestAddr)))
-		fmt.Printf("\n  Open in browser:\n")
-		fmt.Printf("  -> %s\n", browserURL)
-	}
-
-	// Show all addresses.
-	fmt.Printf("\n  Addresses:\n")
-	for _, a := range n.FullAddrs() {
-		fmt.Printf("    %s\n", a)
-	}
-
-	fmt.Printf("\n  Peer ID: %s\n", n.PeerID())
-	fmt.Printf("  Press Ctrl+C to close.\n\n")
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-	fmt.Println("\n  Tunnel closed.")
-}
-
-// encodeAddr base64url-encodes a multiaddr for use in URLs.
-func encodeAddr(multiaddr string) string {
-	encoded := base64.URLEncoding.EncodeToString([]byte(multiaddr))
-	return strings.TrimRight(encoded, "=")
-}
-
-func runGateway(args []string) {
-	fs := flag.NewFlagSet("gateway", flag.ExitOnError)
-	httpAddr := fs.String("http", ":8080", "HTTP listen address")
-	domain := fs.String("domain", "localhost:8080", "Base domain for URLs")
-	p2pPort := fs.Int("p2p-port", 4001, "P2P listen port")
-	peerAddr := fs.String("peer", "", "Direct peer address to connect to")
-	fs.Parse(args)
-
-	fmt.Printf("\n  p2p-tunnel gateway\n\n")
-	fmt.Printf("  Joining P2P network...\n")
-
-	ctx := context.Background()
-	n, err := node.New(ctx, *p2pPort)
-	if err != nil {
+	if err := c.ConnectWithRetry(); err != nil {
 		fmt.Printf("  Error: %v\n", err)
 		os.Exit(1)
 	}
-	defer n.Close()
+	defer c.Close()
 
-	fmt.Printf("  Peer ID:  %s\n", n.PeerID()[:16]+"...")
-
-	if *peerAddr != "" {
-		fmt.Printf("  Connecting to peer directly...\n")
-		if err := n.ConnectToPeer(*peerAddr); err != nil {
-			fmt.Printf("  Warning: direct connect failed: %v\n", err)
-		} else {
-			fmt.Printf("  Connected to peer!\n")
-		}
-	}
-
-	fmt.Printf("  Connecting to bootstrap peers...")
-	time.Sleep(5 * time.Second)
-	fmt.Printf(" %d peers found\n", len(n.Host.Network().Peers()))
-
-	gw := gateway.New(n, *domain)
-
-	fmt.Printf("\n  Gateway active!\n")
-	fmt.Printf("  HTTP:    %s\n", *httpAddr)
-	fmt.Printf("  Domain:  *.%s\n", *domain)
-	fmt.Printf("  Peer ID: %s\n", n.PeerID())
-	fmt.Printf("\n  Routes HTTP requests to tunnel peers via DHT.\n")
-	fmt.Printf("  Press Ctrl+C to stop.\n\n")
+	fmt.Printf("\n  Public URL:    %s\n", c.PublicURL)
+	fmt.Printf("  Forwarding to: localhost:%d\n", port)
+	fmt.Printf("  Relay:         %s\n", *relayAddr)
+	fmt.Printf("\n  Ready! Press Ctrl+C to close.\n\n")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\n  Gateway stopped.")
-		n.Close()
+		fmt.Println("\n  Tunnel closed.")
+		c.Close()
 		os.Exit(0)
 	}()
 
-	if err := gw.ListenAndServe(*httpAddr); err != nil {
-		fmt.Printf("  HTTP server error: %v\n", err)
+	c.Serve()
+}
+
+func runRelay(args []string) {
+	fs := flag.NewFlagSet("relay", flag.ExitOnError)
+	controlAddr := fs.String("control", ":4443", "Control port for tunnel clients")
+	httpAddr := fs.String("http", ":8080", "HTTP port for web traffic")
+	domain := fs.String("d", "localhost:8080", "Base domain (e.g. tunnel.example.com)")
+	fs.Parse(args)
+
+	r := relay.New(*domain)
+
+	// Control listener.
+	controlLn, err := net.Listen("tcp", *controlAddr)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// HTTP server.
+	srv := &http.Server{Addr: *httpAddr, Handler: r}
+	go srv.ListenAndServe()
+
+	fmt.Printf("\n  p2p-tunnel relay\n\n")
+	fmt.Printf("  Control: %s\n", *controlAddr)
+	fmt.Printf("  HTTP:    %s\n", *httpAddr)
+	fmt.Printf("  Domain:  *.%s\n\n", *domain)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Println("\n  Relay stopped.")
+		os.Exit(0)
+	}()
+
+	for {
+		conn, err := controlLn.Accept()
+		if err != nil {
+			return
+		}
+		go r.HandleControl(conn)
 	}
 }

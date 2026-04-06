@@ -1,7 +1,9 @@
 bin/
+dist/
+dist-ghpages/
 *.exe
 *.test
 *.out
-dist/
 web/node_modules/
 web/dist/
+web/dist-ghpages/

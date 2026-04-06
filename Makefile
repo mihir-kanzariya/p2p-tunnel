@@ -8,3 +8,6 @@ clean:
 
 install: build
 	cp bin/p2p-tunnel /usr/local/bin/p2p-tunnel
+
+deploy:
+	fly deploy

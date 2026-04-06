@@ -58,9 +58,14 @@ type Node struct {
 func New(ctx context.Context, port int) (*Node, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
-	// Listen on TCP + WebRTC. QUIC/WebTransport disabled due to quic-go bug with Go 1.26.
+	// Listen on TCP + WebSocket + WebRTC-direct.
+	wsPort := port + 1
+	if port == 0 {
+		wsPort = 0
+	}
 	listenAddrs := []string{
 		fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port),
+		fmt.Sprintf("/ip4/0.0.0.0/tcp/%d/ws", wsPort),
 		fmt.Sprintf("/ip4/0.0.0.0/udp/%d/webrtc-direct", port),
 	}
 
@@ -235,20 +240,22 @@ func (n *Node) PublicWsAddrs() []string {
 }
 
 // BestBrowserAddr returns the best address for browser connectivity.
-// Priority: public WebRTC > relay > public WS > local WS
+// Browsers support: WebSocket, circuit relay (over WS). NOT webrtc-direct.
+// Priority: relay > public WS > LAN WS > localhost WS
 func (n *Node) BestBrowserAddr() string {
-	if addrs := n.PublicWebRTCAddrs(); len(addrs) > 0 {
-		return addrs[0]
-	}
 	if addrs := n.RelayAddrs(); len(addrs) > 0 {
 		return addrs[0]
 	}
 	if addrs := n.PublicWsAddrs(); len(addrs) > 0 {
 		return addrs[0]
 	}
-	if addrs := n.WebRTCAddrs(); len(addrs) > 0 {
-		return addrs[0]
+	// LAN WS (192.168.x, 10.x) — works for same-network access.
+	for _, a := range n.WsAddrs() {
+		if !strings.Contains(a, "/127.") {
+			return a
+		}
 	}
+	// Localhost WS — works when browser is on the same machine.
 	if addrs := n.WsAddrs(); len(addrs) > 0 {
 		return addrs[0]
 	}

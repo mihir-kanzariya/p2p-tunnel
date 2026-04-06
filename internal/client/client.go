@@ -52,6 +52,8 @@ func (c *Client) connectWS() error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
+		// Force HTTP/1.1 — some CDNs (Cloudflare/Render) need this for WS upgrade.
+		EnableCompression: false,
 	}
 	wsConn, _, err := dialer.Dial(wsURL, nil)
 	if err != nil {
@@ -138,17 +140,20 @@ func writeErr(w io.Writer, code int, msg string) {
 }
 
 func (c *Client) ConnectWithRetry() error {
+	var lastErr error
 	for attempt := 1; attempt <= 5; attempt++ {
-		if err := c.Connect(); err == nil {
+		err := c.Connect()
+		if err == nil {
 			return nil
-		} else if attempt == 5 {
-			return err
-		} else {
-			log.Printf("  retry in %ds...", attempt*2)
-			time.Sleep(time.Duration(attempt*2) * time.Second)
 		}
+		lastErr = err
+		if attempt == 5 {
+			return fmt.Errorf("failed after %d attempts: %w", attempt, lastErr)
+		}
+		log.Printf("  attempt %d failed: %v, retry in %ds...", attempt, err, attempt*2)
+		time.Sleep(time.Duration(attempt*2) * time.Second)
 	}
-	return nil
+	return lastErr
 }
 
 func (c *Client) Close() {

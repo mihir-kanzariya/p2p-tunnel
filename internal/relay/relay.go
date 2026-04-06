@@ -57,11 +57,14 @@ func (r *Relay) handleWsControl(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Relay) setupTunnel(conn net.Conn) {
+	log.Printf("[relay] new connection from %s", conn.RemoteAddr())
 	var hs proto.Handshake
 	if err := proto.RecvJSON(conn, &hs); err != nil {
+		log.Printf("[relay] handshake read error: %v", err)
 		conn.Close()
 		return
 	}
+	log.Printf("[relay] handshake: subdomain=%q", hs.Subdomain)
 	sub := strings.TrimSpace(strings.ToLower(hs.Subdomain))
 	if sub == "" {
 		proto.SendJSON(conn, proto.HandshakeResponse{OK: false, Error: "subdomain required"})
